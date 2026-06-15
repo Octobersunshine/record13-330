@@ -65,21 +65,70 @@ def _check_normality(groups, alpha=0.05):
     return normal, non_normal_indices, details
 
 
+def _interpret_result(test_name, p_value, alpha, group_count):
+    significant = p_value < alpha
+    if significant:
+        conclusion = (
+            "在 α={} 的显著性水平下，{}检验结果显著 (p={:.6g})，"
+            "拒绝方差齐性假设，认为各组的方差不相等（方差不齐）"
+            .format(alpha, test_name, p_value)
+        )
+        suggestions = []
+        if group_count == 2:
+            suggestions.append(
+                "两组比较：建议使用 Welch t 检验代替 Student t 检验，"
+                "Welch t 检验不要求方差齐性"
+            )
+        else:
+            suggestions.append(
+                "多组比较：建议使用 Welch ANOVA 代替传统 ANOVA，"
+                "Welch ANOVA 不要求方差齐性"
+            )
+            suggestions.append(
+                "事后多重比较：建议使用 Games-Howell 检验，"
+                "该检验不要求方差齐性且适用于非等样本量"
+            )
+        suggestions.append("可尝试对数据做变换（如对数变换、平方根变换）以稳定方差")
+        suggestions.append("考虑使用非参数方法（如 Kruskal-Wallis 检验）作为替代")
+        return {
+            "conclusion": conclusion,
+            "variance_homogeneous": False,
+            "significant": True,
+            "suggestions": suggestions,
+        }
+    else:
+        conclusion = (
+            "在 α={} 的显著性水平下，{}检验结果不显著 (p={:.6g})，"
+            "不能拒绝方差齐性假设，可认为各组方差相等（方差齐）"
+            .format(alpha, test_name, p_value)
+        )
+        return {
+            "conclusion": conclusion,
+            "variance_homogeneous": True,
+            "significant": False,
+            "suggestions": [],
+        }
+
+
 @app.route("/test/levene", methods=["POST"])
 def levene_test():
     try:
         data = request.get_json(force=True)
         groups = _parse_groups(data)
         center = data.get("center", "median")
+        alpha = float(data.get("alpha", 0.05))
         stat, p = _levene(groups, center)
+        interpretation = _interpret_result("Levene", p, alpha, len(groups))
         return jsonify({
             "test": "levene",
             "center": center,
             "statistic": float(stat),
             "p_value": float(p),
-            "significant_005": bool(p < 0.05),
+            "alpha": alpha,
+            "significant": interpretation["significant"],
             "group_count": len(groups),
             "group_sizes": [int(g.size) for g in groups],
+            "interpretation": interpretation,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -90,27 +139,31 @@ def bartlett_test():
     try:
         data = request.get_json(force=True)
         groups = _parse_groups(data)
-        alpha = float(data.get("normality_alpha", 0.05))
-        normal, non_normal, normality_details = _check_normality(groups, alpha)
+        alpha = float(data.get("alpha", 0.05))
+        normality_alpha = float(data.get("normality_alpha", 0.05))
+        normal, non_normal, normality_details = _check_normality(groups, normality_alpha)
         stat, p = _bartlett(groups)
+        interpretation = _interpret_result("Bartlett", p, alpha, len(groups))
+        if not normal:
+            interpretation["warning"] = (
+                "Bartlett 检验假设数据服从正态分布，但第 {} 组未通过 Shapiro-Wilk "
+                "正态性检验 (α={})，结果可能不可靠，建议使用 Levene 检验"
+                .format(", ".join(str(i) for i in non_normal), normality_alpha)
+            )
+            interpretation["suggestions"].insert(0, "数据非正态，Bartlett 检验结果可能不可靠，建议以 Levene 检验结果为准")
         result = {
             "test": "bartlett",
             "statistic": float(stat),
             "p_value": float(p),
-            "significant_005": bool(p < 0.05),
+            "alpha": alpha,
+            "significant": interpretation["significant"],
             "group_count": len(groups),
             "group_sizes": [int(g.size) for g in groups],
             "normality_assumed": normal,
-            "normality_alpha": alpha,
+            "normality_alpha": normality_alpha,
             "normality_details": normality_details,
+            "interpretation": interpretation,
         }
-        if not normal:
-            result["warning"] = (
-                "Bartlett 检验假设数据服从正态分布，但第 {} 组未通过 Shapiro-Wilk "
-                "正态性检验 (α={})，结果可能不可靠，建议使用 Levene 检验"
-                .format(", ".join(str(i) for i in non_normal), alpha)
-            )
-            result["recommendation"] = "levene"
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -122,43 +175,50 @@ def both_tests():
         data = request.get_json(force=True)
         groups = _parse_groups(data)
         center = data.get("center", "median")
-        alpha = float(data.get("normality_alpha", 0.05))
-        normal, non_normal, normality_details = _check_normality(groups, alpha)
+        alpha = float(data.get("alpha", 0.05))
+        normality_alpha = float(data.get("normality_alpha", 0.05))
+        normal, non_normal, normality_details = _check_normality(groups, normality_alpha)
         l_stat, l_p = _levene(groups, center)
         b_stat, b_p = _bartlett(groups)
-        bartlett_result = {
-            "test": "bartlett",
-            "statistic": float(b_stat),
-            "p_value": float(b_p),
-            "significant_005": bool(b_p < 0.05),
-            "normality_assumed": normal,
-        }
+        l_interp = _interpret_result("Levene", l_p, alpha, len(groups))
+        b_interp = _interpret_result("Bartlett", b_p, alpha, len(groups))
         if not normal:
-            bartlett_result["warning"] = (
+            b_interp["warning"] = (
                 "Bartlett 检验假设数据服从正态分布，但第 {} 组未通过 Shapiro-Wilk "
-                "正态性检验 (α={})，结果可能不可靠，建议使用 Levene 检验"
-                .format(", ".join(str(i) for i in non_normal), alpha)
+                "正态性检验 (α={})，结果可能不可靠，建议以 Levene 检验结果为准"
+                .format(", ".join(str(i) for i in non_normal), normality_alpha)
             )
-            bartlett_result["recommendation"] = "levene"
+            b_interp["suggestions"].insert(0, "数据非正态，Bartlett 检验结果可能不可靠，建议以 Levene 检验结果为准")
         levene_result = {
             "test": "levene",
             "center": center,
             "statistic": float(l_stat),
             "p_value": float(l_p),
-            "significant_005": bool(l_p < 0.05),
+            "significant": l_interp["significant"],
+            "interpretation": l_interp,
         }
+        bartlett_result = {
+            "test": "bartlett",
+            "statistic": float(b_stat),
+            "p_value": float(b_p),
+            "significant": b_interp["significant"],
+            "normality_assumed": normal,
+            "interpretation": b_interp,
+        }
+        recommended_test = None
         if not normal:
-            levene_result["note"] = "数据非正态，Levene 检验更稳健，推荐使用本结果"
+            recommended_test = "levene"
             levene_result["recommended"] = True
         return jsonify({
             "levene": levene_result,
             "bartlett": bartlett_result,
             "group_count": len(groups),
             "group_sizes": [int(g.size) for g in groups],
-            "normality_alpha": alpha,
+            "alpha": alpha,
+            "normality_alpha": normality_alpha,
             "normality_assumed": normal,
             "normality_details": normality_details,
-            "recommended_test": "levene" if not normal else None,
+            "recommended_test": recommended_test,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
